@@ -15,7 +15,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+// file index -> the buffers created over that file's mapping (several when the
+// mapped range is split around lazily-read tensors that belong to another buffer type)
+using llama_buf_map = std::unordered_map<uint32_t, std::vector<ggml_backend_buffer_t>>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
