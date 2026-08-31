@@ -1787,12 +1787,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+
+                // a lazily-read tensor (e.g. a per-layer embedding table kept on the CPU) can sit in the
+                // middle of the range used by this buffer type. leave it out of the device buffer:
+                // on unified memory the device pins every page of a mapped buffer, which would keep the
+                // whole table resident and defeat the lazy read. lazy tensors live in their own context
+                // (ctx_key.lazy), so a lazy context keeps its range as-is and every other context skips them.
+                llama_mmap::ranges sub_ranges = { { first, last } };
+                if (!ctx_key.lazy) {
+                    for (const auto & [lazy_first, lazy_last] : ml.lazy.for_file(idx)) {
+                        llama_mmap::ranges next;
+                        for (const auto & [a, b] : sub_ranges) {
+                            if (lazy_last <= a || lazy_first >= b) {
+                                next.emplace_back(a, b);
+                                continue;
+                            }
+                            if (a < lazy_first) {
+                                next.emplace_back(a, lazy_first);
+                            }
+                            if (lazy_last < b) {
+                                next.emplace_back(lazy_last, b);
+                            }
+                        }
+                        if (next != sub_ranges) {
+                            LLAMA_LOG_INFO("%s: %s buffer for file %u skips a lazily-read range of %zu MiB\n",
+                                    __func__, ggml_backend_buft_name(buft), idx, (lazy_last - lazy_first)/1024/1024);
+                        }
+                        sub_ranges = std::move(next);
+                    }
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
+
+                for (const auto & [sub_first, sub_last] : sub_ranges) {
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + sub_first, sub_last - sub_first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map[idx].push_back(buf);
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -1815,7 +1847,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+                buf_map[idx].push_back(buf);
             }
         }
 
@@ -1862,7 +1894,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!ml.use_mmap) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
             const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            // PLE split: 1 バッファ型あたり複数バッファを持つので先頭で判定する
+            // (同じ buft から作るので is_host はどれも同じ)。
+            if (buf_map.empty()) {
+                return false;
+            }
+            const auto & bufs = buf_map.begin()->second;
+            return !bufs.empty() && !ggml_backend_buffer_is_host(bufs.front());
         });
     }
 
